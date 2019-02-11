@@ -21,29 +21,29 @@ spec:
           required: ["pools"]
           properties:
             pools:
-              description: A list of pool names and usage values.
+              description: List of CPU pools, their CPUs, current capacity, and usage.
               type: array
               properties:
                 items:
                   properties:
                     poolName:
-                      description: Name of the CPU pool
-                      type: string
-                    usage:
-                      description: Pool usage value in millicores.
-                      type: integer
-                    capacity:
-                      description: Pool capacity value in millicores.
-                      type: integer
-                    exclusive:
-                      description: Exclusive CPUset
+                      description: CPU pool name.
                       type: string
                     shared:
-                      description: Shared CPUset
+                      description: CPU pool CPUs, idle/in shared use.
                       type: string
+                    exclusive:
+                      description: CPU pool CPUs in exclusive use.
+                      type: string
+                    capacity:
+                      description: CPU pool capacity in millicores.
+                      type: integer
+                    usage:
+                      description: CPU pool usage in millicores.
+                      type: integer
                   required:
                   - poolName
-                  - usage
-                  - capacity
-                  - exclusive
                   - shared
+                  - exclusive
+                  - capacity
+                  - usage

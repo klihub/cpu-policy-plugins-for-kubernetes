@@ -17,6 +17,7 @@ limitations under the License.
 package metrics
 
 import (
+	"sort"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager/stub"
 
@@ -29,81 +30,176 @@ const (
 	logPrefix = "[cpu-policy/metrics] " // log message prefix
 )
 
+// Cached per pool metrics data.
+type pool struct {
+	name      string                    // pool name
+	shared    cpuset.CPUSet             // shared subset of pool CPUs
+	exclusive cpuset.CPUSet             // exclusively allocated CPUs
+	capacity  int64                     // total pool CPU capacity
+	usage     int64                     // pool CPU capacity in use
+}
+
+// Metrics client and pool data.
 type Metrics struct {
-	nodeName  string             // node name
-	clientset *poolapi.Clientset // clientset for REST API
-	namespace string             // namespace
-	metric    *types.Metric      // pending metrics to be published
+	clientset *poolapi.Clientset        // clientset for talking to REST API
+	nodename  string                    // our node name
+	namespace string                    // metrics CRD namespace
+	metric    *types.Metric             // metrics CRD on the server
+	pools     map[string]*pool          // cached pool metrics data
 }
 
 // our logger instance
 var log = stub.NewLogger(logPrefix)
 
-// Create an interface for publishing pool metrics data as a CRD.
-func NewMetrics(nodeName, namespace string, cs *poolapi.Clientset) *Metrics {
-	return &Metrics{
-		nodeName:  nodeName,
+// Create an object for publishing pool metrics data as a CRD.
+func NewMetrics(nodename, namespace string, cs *poolapi.Clientset) *Metrics {
+	m := &Metrics{
 		clientset: cs,
+		nodename:  nodename,
 		namespace: namespace,
+		pools:     make(map[string]*pool),
 	}
+
+	if err := m.syncOrCreate(); err != nil {
+		log.Error("failed to fetch or create metrics CRD: %s", err.Error())
+	}
+
+	return m
 }
 
+// Update metrics for the given pool.
 func (m *Metrics) UpdatePool(name string, shared, exclusive cpuset.CPUSet, capacity, usage int64) error {
-	log.Info("pool %s: updating metrics to <shared=%s, pinned=%s, capacity=%d, usage=%d>",
+	m.pools[name] = &pool{
+		name:      name,
+		shared:    shared.Clone(),
+		exclusive: exclusive.Clone(),
+		capacity:  capacity,
+		usage:     usage,
+	}
+
+	log.Info("updated pool %s: <shared=%s, pinned=%s, capacity=%d, usage=%d>",
 		name, shared, exclusive, capacity, usage)
-
-	// first see if the Metric object is already present
-	metric, err := m.clientset.CpupoolsV1draft1().Metrics(m.namespace).Get(m.nodeName, metav1.GetOptions{})
-
-	if err != nil {
-		metric = &types.Metric{
-			ObjectMeta: metav1.ObjectMeta{Name: m.nodeName},
-			Spec:       types.MetricSpec{Pools: []types.Pool{}},
-		}
-		metric, err = m.clientset.CpupoolsV1draft1().Metrics(m.namespace).Create(metric)
-		if err != nil {
-			log.Error("failed to create metrics CRD: %s", err.Error())
-			return err
-		}
-	}
-
-	updated := []types.Pool{}
-	pool := &types.Pool{
-		PoolName: name,
-		Exclusive: exclusive.String(),
-		Shared: shared.String(),
-		Capacity: capacity,
-		Usage: usage,
-	}
-	for _, p := range metric.Spec.Pools {
-		if p.PoolName != name {
-			updated = append(updated, p)
-		} else {
-			updated = append(updated, *pool);
-			pool = nil
-		}
-	}
-	if pool != nil {
-		updated = append(updated, *pool)
-	}
-	metric.Spec.Pools = updated
-
-	m.metric = metric
 
 	return nil
 }
 
-// Published current gathered metrics for pools.
-func (m *Metrics) Publish() error {
-	log.Info("publishing pool metrics")
+// Delete metrics for the given pool.
+func (m *Metrics) DeletePool(name string) bool {
+	_, found := m.pools[name]
+	if found {
+		delete(m.pools, name)
+		log.Info("deleted pool %s", name)
+	}
 
-	if _, err := m.clientset.CpupoolsV1draft1().Metrics(m.namespace).Update(m.metric); err != nil {
+	return found
+}
+
+// Delete metrics for all pools.
+func (m *Metrics) DeleteAllPools() {
+	m.pools = make(map[string]*pool)
+}
+
+// Publish current gathered metrics for pools.
+func (m *Metrics) Publish() error {
+	return m.update()
+}
+
+// Fetch metrics CRD from server if it exists, otherwise create CRD on the server.
+func (m *Metrics) syncOrCreate() error {
+	if m.fetch() == nil {
+		return nil
+	}
+
+	return m.create()
+}
+
+// Create metrics CRD on the server.
+func (m *Metrics) create() error {
+	metric, err := m.clientset.
+		CpupoolsV1draft1().
+		Metrics(m.namespace).
+		Create(
+		&types.Metric{
+			ObjectMeta: metav1.ObjectMeta{Name: m.nodename},
+			Spec:       types.MetricSpec{Pools: []types.Pool{}},
+		})
+
+	if err != nil {
+		return err
+	}
+
+	m.metric = metric
+	log.Info("created pool metrics CRD")
+
+	return nil
+}
+
+// Fetch metrics CRD from the server.
+func (m *Metrics) fetch() error {
+	metric, err := m.clientset.
+		CpupoolsV1draft1().
+		Metrics(m.namespace).
+		Get(m.nodename, metav1.GetOptions{})
+
+	if err != nil {
+		return err
+	}
+
+	m.metric = metric
+
+	for _, p := range metric.Spec.Pools {
+		m.pools[p.PoolName] = &pool{
+			name:      p.PoolName,
+			shared:    cpuset.MustParse(p.Shared),
+			exclusive: cpuset.MustParse(p.Exclusive),
+			capacity:  p.Capacity,
+			usage:     p.Usage,
+		}
+
+		log.Info("fetched pool %s metrics: <shared=%s, pinned=%s, capacity=%d, usage=%d>",
+			p.PoolName, p.Shared, p.Exclusive, p.Capacity, p.Usage)
+	}
+
+	return nil
+}
+
+// Update metrics CRD on the server from cached pool metrics.
+func (m *Metrics) update() error {
+	var idx int
+
+	pools := make([]string, len(m.pools))
+	idx = 0
+	for name, _ := range m.pools {
+		pools[idx] = name
+		idx++
+	}
+	sort.Strings(pools)
+
+	updates := make([]types.Pool, len(pools))
+	idx = 0
+	for _, pool := range pools {
+		updates[idx] = types.Pool{
+			PoolName:  m.pools[pool].name,
+			Shared:    m.pools[pool].shared.String(),
+			Exclusive: m.pools[pool].exclusive.String(),
+			Capacity:  m.pools[pool].capacity,
+			Usage:     m.pools[pool].usage,
+		}
+		idx++
+	}
+	m.metric.Spec.Pools = updates
+
+	metric, err := m.clientset.CpupoolsV1draft1().
+		Metrics(m.namespace).
+		Update(m.metric)
+
+	if err != nil {
 		log.Error("failed to publish pool metrics: %s", err.Error())
 		return err
 	}
 
-	m.metric = nil
-
+	log.Info("published/updated pool metrics CRD")
+	m.metric = metric
 	return nil
 }
 
