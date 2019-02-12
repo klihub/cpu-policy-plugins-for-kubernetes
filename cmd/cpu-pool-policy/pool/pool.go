@@ -259,7 +259,7 @@ func (ps *PoolSet) restoreConfig() error {
 		}
 	}
 
-	// remove newly added pools
+	// remove pools recently added by prepareConfig
 	for pool, _ := range ps.pools {
 		if _, ok := ps.currentCfg[pool]; !ok {
 			delete(ps.pools, pool)
@@ -745,6 +745,7 @@ func (ps *PoolSet) updatePoolMetrics(pool string, publish bool) {
 
 // Update all pool metrics.
 func (ps *PoolSet) updateMetrics() {
+	ps.metrics.DeleteAllPools()
 	for pool := range ps.pools {
 		ps.updatePoolMetrics(pool, false)
 	}
