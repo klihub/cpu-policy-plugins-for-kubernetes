@@ -26,6 +26,7 @@ import (
 
 	"github.com/klihub/cpu-policy-plugins-for-kubernetes/cmd/cpu-pool-policy/pool"
 	"github.com/klihub/cpu-policy-plugins-for-kubernetes/cmd/cpu-pool-policy/metrics"
+
 	"k8s.io/api/core/v1"
 	stub "k8s.io/kubernetes/pkg/kubelet/cm/cpumanager/stub"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager/topology"
@@ -404,6 +405,7 @@ func (glb *glogBackend) FatalDepth(level int, args ...interface{}) {
 // Start up the pool CPU policy.
 func main() {
 	stub.SetBackend(&glogBackend{})
+
 	cfg := getPluginConfig()
 	plugin := NewPoolPolicy(cfg)
 
@@ -412,3 +414,4 @@ func main() {
 	}
 
 }
+

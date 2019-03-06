@@ -45,8 +45,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sort"
 
+	//"github.com/klihub/cpu-policy-plugins-for-kubernetes/pkg/procfs"
+	"github.com/klihub/cpu-policy-plugins-for-kubernetes/pkg/sysfs"
+	"github.com/klihub/cpu-policy-plugins-for-kubernetes/pkg/cpuallocator"
 	"github.com/klihub/cpu-policy-plugins-for-kubernetes/cmd/cpu-pool-policy/metrics"
+
 	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
@@ -86,7 +91,7 @@ type PoolSet struct {
 	pools      map[string]*Pool      // all CPU pools
 	containers map[string]*Container // container assignments
 	topology   *topology.CPUTopology // CPUManager CPU topology info
-	sys        *stub.SystemInfo      // system/topology information
+	sys        *sysfs.System         // system/topology information
 	free       cpuset.CPUSet         // free CPUs
 	offlined   cpuset.CPUSet         // CPUs taken offline
 	metrics    *metrics.Metrics      // metrics interface
@@ -153,7 +158,7 @@ func (p *Pool) String() string {
 func NewPoolSet(ncfg NodeConfig, metrics *metrics.Metrics) (*PoolSet, error) {
 	log.Info("creating new CPU pool set")
 
-	sys, err := stub.DiscoverSystemInfo("")
+	sys, err := sysfs.DiscoverSystem()
 	if err != nil {
 		return nil, err
 	}
@@ -196,11 +201,15 @@ func (ps *PoolSet) Reconfigure(ncfg NodeConfig) error {
 	return ps.reconcileConfig()
 }
 
-// Get the cpuset of all CPUs and their HT-siblings in the given cpuset.
-func hyperthreadCPUSet(sys *stub.SystemInfo, cset *cpuset.CPUSet) cpuset.CPUSet {
+// Get the set of hyperthreads for the given set of CPUs.
+func (ps *PoolSet) htSiblingCPUSet(cset *cpuset.CPUSet) cpuset.CPUSet {
 	b := cpuset.NewBuilder()
 	for _, id := range cset.ToSlice() {
-		b.Add(sys.ThreadSiblingCPUSet(id, true).ToSlice()...)
+		for _, sid := range ps.sys.Cpu(sysfs.Id(id)).ThreadCPUSet().ToSlice() {
+			if int(sid) != id {
+				b.Add(int(sid))
+			}
+		}
 	}
 	return b.Result()
 }
@@ -218,12 +227,14 @@ func (ps *PoolSet) prepareReservedPool(cfg NodeConfig) error {
 			return configError("pool %s: cpu #0 must belong to the reserved pool", ReservedPool)
 		}
 	} else {
-		// set up reserved pool to include CPU#0
-		sys  := ps.sys
+		// set up reserved pool (always include CPU#0)
+		cpus := ps.sys.CpuIds(); sort.Slice(cpus, func (i, j int) bool {
+			return cpus[i] < cpus[j]
+		})
 		cset := cpuset.NewCPUSet()
 		ncpu := rc.CpuCount
-		for _, id := range sys.CPUSet().ToSlice() {
-			tset := sys.ThreadCPUSet(id).Difference(cset)
+		for _, id := range cpus {
+			tset := ps.sys.Cpu(id).ThreadCPUSet().Difference(cset)
 			if ncpu < tset.Size() {
 				cset = cset.Union(cpuset.NewCPUSet(tset.ToSlice()[0:ncpu]...))
 				ncpu = 0
@@ -271,9 +282,8 @@ func (ps *PoolSet) restoreConfig() error {
 
 // Prepare configuration, check conflicts, collect leftover and offline CPUs.
 func (ps *PoolSet) prepareConfig(ncfg NodeConfig) error {
-	sys       := ps.sys
-	isolated  := sys.IsolatedCPUSet()
-	available := sys.CPUSet().Difference(isolated)
+	isolated  := isolatedCPUSet()
+	available := ps.sys.CPUSet().Difference(isolated)
 	offlined  := cpuset.NewCPUSet()
 	leftover  := make(map[bool]string)
 
@@ -319,7 +329,7 @@ func (ps *PoolSet) prepareConfig(ncfg NodeConfig) error {
 
 		// check that there is no HT-free/offlining conflict
 		if pcfg.DisableHT {
-			siblings := hyperthreadCPUSet(sys, pcfg.Cpus)
+			siblings := ps.htSiblingCPUSet(pcfg.Cpus)
 			if !siblings.IsSubsetOf(available) && !siblings.IsSubsetOf(offlined) {
 				return configError("pool %s: some of CPUs #%s cannot be put offline", pool, siblings)
 			}
@@ -455,24 +465,31 @@ func (ps *PoolSet) updateAllocations() error {
 	return nil
 }
 
-// Update hardware (CPU online/offline, clock frequency) configuration.
-func (ps *PoolSet) updateHwConfiguration() error {
-	for _, id := range ps.sys.CPUSet().ToSlice() {
-		offline := ps.offlined.Contains(id)
-		if offline {
-			log.Info("setting CPU#%d offline...", id)
-		} else {
-			log.Info("setting CPU#%d online...", id)
-		}
-		if err := ps.sys.SetOffline(id, offline); err != nil {
-			log.Warning("%s", err)
-		}
+// Update CPU online/offline state according to the configuration.
+func (ps *PoolSet) updateCpuOnlineState() error {
+	if _, err := ps.sys.SetCpusOnline(true, sysfs.NewIdSet(ps.sys.CpuIds()...)); err != nil {
+		return err
 	}
 
+	if ps.offlined.IsEmpty() {
+		return nil
+	}
+
+	offline := sysfs.NewIdSetFromIntSlice(ps.offlined.ToSlice()...)
+	_, err := ps.sys.SetCpusOnline(false, offline)
+
+	return err
+}
+
+// Update CPU frequency range according to the configuration.
+func (ps *PoolSet) updateCpuFrequencyRange() error {
 	for _, p := range ps.pools {
 		if p.cfg.MinFreq != 0 || p.cfg.MaxFreq != 0 {
-			for _, id := range p.shared.Union(p.pinned).ToSlice() {
-				ps.sys.SetCpuFrequencyLimits(id, p.cfg.MinFreq, p.cfg.MaxFreq)
+			for _, i := range p.shared.Union(p.pinned).ToSlice() {
+				id := sysfs.Id(i)
+				if err := ps.sys.Cpu(id).SetFrequencyLimits(p.cfg.MinFreq, p.cfg.MaxFreq); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -480,9 +497,22 @@ func (ps *PoolSet) updateHwConfiguration() error {
 	return nil
 }
 
+// Update hardware (CPU online/offline, clock frequency) configuration.
+func (ps *PoolSet) updateHwConfiguration() error {
+	if err := ps.updateCpuOnlineState(); err != nil {
+		return err
+	}
+
+	if err := ps.updateCpuFrequencyRange(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // Take up to cnt CPUs from a given CPU set to another.
 func (ps *PoolSet) takeCPUs(from, to *cpuset.CPUSet, cnt int) (cpuset.CPUSet, error) {
-	if cset, err := stub.AllocateCpus(from, cnt); err != nil {
+	if cset, err := cpuallocator.AllocateCpus(from, cnt); err != nil {
 		return cset, err
 	} else {
 		*to = to.Union(cset)
@@ -833,7 +863,7 @@ func (ps PoolSet) MarshalJSON() ([]byte, error) {
 	return json.Marshal(marshalPoolSet{
 		Pools:      ps.pools,
 		Containers: ps.containers,
-		Isolated:   ps.sys.IsolatedCPUSet(),
+		Isolated:   isolatedCPUSet(),
 		CurrentCfg: ps.currentCfg,
 		PendingCfg: ps.pendingCfg,
 	})
@@ -851,9 +881,9 @@ func (ps *PoolSet) UnmarshalJSON(b []byte) error {
 	ps.currentCfg = m.CurrentCfg
 	ps.pendingCfg = m.PendingCfg
 
-	if !m.Isolated.Equals(ps.sys.IsolatedCPUSet()) {
+	if !m.Isolated.Equals(isolatedCPUSet()) {
 		return fmt.Errorf("isolated cpuset has changed: %s -> %s",
-			m.Isolated.String(), ps.sys.IsolatedCPUSet().String())
+			m.Isolated.String(), isolatedCPUSet().String())
 	}
 
 	return nil

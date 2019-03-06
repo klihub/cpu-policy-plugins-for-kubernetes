@@ -23,8 +23,8 @@ import (
 	"io/ioutil"
 	"encoding/json"
 
+	"github.com/klihub/cpu-policy-plugins-for-kubernetes/pkg/procfs"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
-	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager/stub"
 )
 
 const (
@@ -63,22 +63,21 @@ var isolated *cpuset.CPUSet
 
 // Get the set of kernel-isolated CPUs.
 func isolatedCPUSet() cpuset.CPUSet {
-	if isolated != nil {
-		return *isolated
+	if isolated == nil {
+		kcl, err := procfs.GetKernelCmdline()
+		if err != nil {
+			panic(fmt.Sprintf("failed to get/parse kernel commandline: %v", err))
+		}
+
+		cset, err := kcl.IsolatedCPUSet()
+		if err != nil {
+			panic(fmt.Sprintf("failed to get set of isolated CPUs: %v", err))
+		}
+
+		isolated = &cset
 	}
 
-	kcl, err := stub.GetKernelCmdline()
-	if err != nil {
-		panic(fmt.Sprintf("failed to parse kernel command line: %v", err))
-	}
-
-	cset, err := kcl.IsolatedCPUSet()
-	if err != nil {
-		panic(fmt.Sprintf("failed to get isolated cpus: %v", err))
-	}
-
-	isolated = &cset
-	return cset
+	return *isolated
 }
 
 // Create default CPU pool set configuration.
