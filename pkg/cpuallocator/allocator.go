@@ -15,6 +15,7 @@
 package cpuallocator
 
 import (
+	"flag"
 	"fmt"
 	"sync"
 	"sort"
@@ -34,7 +35,8 @@ const (
 	AllocIdleCores                                    // prefer idle cores
 	AllocDefault = AllocIdlePackages | AllocIdleCores // default flags
 
-	logPrefix = "[pool-policy/cpuallocator] "
+	logPrefix = "[cpuallocator] "
+	debugFlag = "cpu-allocator-debug"
 )
 
 // CpuAllocator encapsulates state for allocating CPUs.
@@ -63,6 +65,11 @@ type sysfsSingleton struct {
 }
 
 var system sysfsSingleton
+var debug bool
+
+func init() {
+	flag.BoolVar(&debug, debugFlag, false, "enable CPU allocator debug log")
+}
 
 // Types of functions for filtering and sorting packages, nodes, and CPU cores.
 type IdFilter func (sysfs.Id) bool
@@ -151,8 +158,18 @@ func NewCpuAllocator(sys *sysfs.System) *CpuAllocator {
 	return a
 }
 
+func (a *CpuAllocator) debug(format string, args ...interface{}) {
+	if !debug {
+		return
+	}
+
+	log.Info(format, args...)
+}
+
 // Allocate full idle CPU packages.
 func (a *CpuAllocator) takeIdlePackages() {
+	a.debug("* takeIdlePackages()...")
+
 	offline := a.sys.Offlined()
 
 	// pick idle packages
@@ -168,10 +185,14 @@ func (a *CpuAllocator) takeIdlePackages() {
 			return pkgs[i] < pkgs[j]
 		})
 
+	a.debug(" => idle packages sorted by preference: %v", pkgs)
+
 	// take as many idle packages as we need/can
 	for _, id := range pkgs {
 		cset := system.PackageCPUSet(id).Difference(offline)
+		a.debug(" => considering package %v (#%s)...", id, cset)
 		if a.cnt >= cset.Size() {
+			a.debug(" => taking pakcage %v...", id)
 			a.result = a.result.Union(cset)
 			a.from = a.from.Difference(cset)
 			a.cnt -= cset.Size()
@@ -185,6 +206,8 @@ func (a *CpuAllocator) takeIdlePackages() {
 
 // Allocate full idle CPU cores.
 func (a *CpuAllocator) takeIdleCores() {
+	a.debug("* takeIdleCores()...")
+
 	offline := a.sys.Offlined()
 
 	// pick (first id for all) idle cores
@@ -200,10 +223,14 @@ func (a *CpuAllocator) takeIdleCores() {
 			return cores[i] < cores[j]
 		})
 
+	a.debug(" => idle cores sorted by preference: %v", cores)
+
 	// take as many idle cores as we can
 	for _, id := range cores {
 		cset := system.CoreCPUSet(id).Difference(offline)
+		a.debug(" => considering core %v (#%s)...", id, cset)
 		if a.cnt >= cset.Size() {
+			a.debug(" => taking core %v...", id)
 			a.result = a.result.Union(cset)
 			a.from = a.from.Difference(cset)
 			a.cnt -= cset.Size()
@@ -217,13 +244,14 @@ func (a *CpuAllocator) takeIdleCores() {
 
 // Allocate idle CPU hyperthreads.
 func (a *CpuAllocator) takeIdleThreads() {
+	a.debug("* takeIdlethreads()...")
+
 	offline := a.sys.Offlined()
 
-	// pick (first id for all) cores with free capacity
+	// pick all threads with free capacity
 	cores := system.pick(a.sys.CpuIds(),
 		func (id sysfs.Id) bool {
-			cset := system.CoreCPUSet(id).Difference(offline)
-			return cset.Intersection(a.from).Size() != 0 && cset.ToSlice()[0] == int(id)
+			return a.from.Difference(offline).Contains(int(id))
 		})
 	// sorted for preference by id, mimicking cpus_assignment.go for now:
 	//   IOW, prefer CPUs
@@ -264,17 +292,19 @@ func (a *CpuAllocator) takeIdleThreads() {
 			return iPkg < jPkg || iCore < jCore
 		})
 
+	a.debug(" => idle threads sorted by preference: %v", cores)
+
 	// take as many idle cores as we can
 	for _, id := range cores {
 		cset := system.CoreCPUSet(id).Difference(offline)
-		if a.cnt >= cset.Size() {
-			a.result = a.result.Union(cset)
-			a.from = a.from.Difference(cset)
-			a.cnt -= cset.Size()
+		a.debug(" => considering thread %v (#%s)...", id, cset)
+		cset = cpuset.NewCPUSet(int(id))
+		a.result = a.result.Union(cset)
+		a.from = a.from.Difference(cset)
+		a.cnt -= cset.Size()
 
-			if a.cnt == 0 {
-				break
-			}
+		if a.cnt == 0 {
+			break
 		}
 	}
 }
@@ -327,14 +357,10 @@ func allocateCpus(from *cpuset.CPUSet, cnt int) (cpuset.CPUSet, error) {
 
 // Allocate a number of CPUs from the given set.
 func AllocateCpus(from *cpuset.CPUSet, cnt int) (cpuset.CPUSet, error) {
-	log.Info("* AllocateCpus(CPUs #%s, %d)", from, cnt)
-
 	result, err := allocateCpus(from, cnt)
 
-	if err == nil {
-		log.Info("  => took CPUs: #%s, remaining: #%s", result, *from)
-	} else {
-		log.Info("  => failed: %v", err)
+	if debug {
+		log.Info("AllocateCpus(#%s, %d) => #%s", from.String(), cnt, result)
 	}
 
 	return result, err
@@ -342,14 +368,17 @@ func AllocateCpus(from *cpuset.CPUSet, cnt int) (cpuset.CPUSet, error) {
 
 // Release a number of CPUs from the given set.
 func ReleaseCpus(from *cpuset.CPUSet, cnt int) (cpuset.CPUSet, error) {
-	log.Info("* ReleaseCpus(CPUs #%s, %d)", from, cnt)
+	var oset cpuset.CPUSet
+
+	if debug {
+		oset = from.Clone()
+	}
 
 	result, err := allocateCpus(from, from.Size() - cnt)
 
-	if err == nil {
-		log.Info("  => kept CPUs: #%s, gave: #%s", from, result)
-	} else {
-		log.Info("  => failed: %v", err)
+	if debug {
+		log.Info("ReleaseCpus(#%s, %d) => kept: #%s, released: #%s", oset.String(), cnt,
+			from.String(), result)
 	}
 
 	return result, err

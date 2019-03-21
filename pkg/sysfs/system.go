@@ -28,7 +28,7 @@ const (
 	SysfsPath       = "/sys"                       // default sysfs mount point
 	systemCpuPath   = "devices/system/cpu"         // sysfs system cpu subdir
 	systemNodePath  = "devices/system/node"        // sysfs system node subdir
-	logPrefix       = "[pool-policy/sysfs] "
+	logPrefix       = "[sysfs] "
 )
 
 type DiscoveryFlag uint
