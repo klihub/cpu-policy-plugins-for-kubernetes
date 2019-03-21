@@ -388,10 +388,10 @@ func (sys *System) discoverCpu(path string) error {
 		return err
 	}
 	if _, err := readSysfsEntry(path, "cpufreq/cpuinfo_min_freq", &cpu.freq.min); err != nil {
-		return err
+		cpu.freq.min = 0
 	}
 	if _, err := readSysfsEntry(path, "cpufreq/cpuinfo_max_freq", &cpu.freq.max); err != nil {
-		return err
+		cpu.freq.max = 0
 	}
 	if node, _ := filepath.Glob(filepath.Join(path, "node[0-9]*")); len(node) == 1 {
 		cpu.node = getEnumeratedId(node[0])
